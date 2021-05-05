@@ -1,0 +1,305 @@
+---
+title: "Spam Notebook"
+output: html_notebook
+---
+# Business Understanding
+Spam can lead to some bad stuff, let's stop it.
+
+## Load libraries and packages
+```{r}
+library(e1071)  
+require(xgboost)
+library(pROC)
+library(magrittr)
+library(dplyr)
+```
+Load data 
+```{r}
+rm(list=ls())
+spam<-read.csv("/Users/kent/Library/Mobile Documents/com~apple~CloudDocs/Leeds/Spring/MSBX5415-002AdvancedDataAnalytics/Project/dataset_44_spambase.csv",header=T,na.strings=c("","NA"))
+```
+Quick look at top of the file
+```{r}
+head(spam)
+```
+Quick look at the bottom of the file
+```{r}
+tail(spam)
+```
+How big is file
+```{r}
+dim(spam)
+```
+# Data Understanding
+This data is a curated sample from HP, should not be considered a random sample, each row is an email
+word_freq... = frequency of word in email
+char_freq... = " character
+capital... = stats on capitalized...
+class = label, target, binary
+
+Look at content, quick summary
+```{r}
+str(spam)
+```
+Descriptive stats
+```{r}
+summary(spam)
+```
+
+```{r}
+names<-names(spam)
+```
+Look at column headers
+```{r}
+print(names)
+```
+
+```{r}
+column_names<-colnames(spam)
+```
+Look at target, labeled 1 as spam, 0 as not spam
+```{r}
+as.factor(spam$class)
+```
+Look at amount of zero's, data seems to be super clean and ready to roll, 0's are legitimate since not every email has dictionary in it, content wise
+```{r}
+colSums(is.na(spam))
+for (i in names(spam)){
+  print(c('Percentage of zeros in ',i,sum(spam[,i]==0)/nrow(spam)))}
+```
+## A little EDA
+
+Look at skewness
+```{r}
+for (i in names(spam)){
+  print(c('Skewness in ',i,skewness(spam[,i])))}
+
+for (i in names(spam)){
+  hist(spam[,i],main=i,breaks=50)}
+```
+## A little more EDA
+
+Look at boxplots
+```{r}
+for (i in names(spam)){
+  boxplot(spam[,i],main=i)}
+```
+## A even a little EDA
+
+Look at correlations
+```{r}
+M <- cor(spam)
+library(corrplot)
+corrplot(M,method="color",order="FPC")
+```
+# Data Preparation
+
+Convert the class factor to an integer class starting at 0.
+This is picky, but it's a requirement for XGBoost
+```{r}
+class<-spam$class
+label<-as.integer(spam$class)
+spam$class<-NULL
+```
+Split the data for training and testing (70/20/10 train/test/holdout split)
+```{r}
+n<-nrow(spam)                                
+set.seed(123)
+train_index<-sample(n,floor(0.70*n))         
+train_data<-as.matrix(spam[train_index,])
+train_label<-label[train_index]
+
+testholdout_data<-spam[-train_index,]       
+testholdout_label<-label[-train_index]
+nth<-nrow(testholdout_data)
+th_index<-sample(nth,floor(0.67*nth))        
+test_data<-as.matrix(testholdout_data[th_index,])
+test_label<-testholdout_label[th_index]
+holdout_data<-as.matrix(testholdout_data[-th_index,])
+holdout_label<-testholdout_label[-th_index]
+```
+Transform the two data sets into xgb.Matrix
+```{r}
+xgb_train<-xgb.DMatrix(data=train_data,label=train_label)
+xgb_test<-xgb.DMatrix(data=test_data,label=test_label)
+```
+Get the number of negative & positive cases in our data
+```{r}
+negative_cases <- sum(train_label==0)
+postive_cases <- sum(train_label==1)
+```
+# Modeling
+## XGBoost
+
+Chosen because I am trying to use a different model for every project
+
+First pass
+```{r}
+params<-list(booster="gbtree",                       # default
+             objective="binary:logistic",            # the objective function
+             eta=0.3,                                
+             gamma=0,
+             max_depth=6,                            # the maximum depth of each decision tree
+             min_child_weight=1,
+#             scale_pos_weight = negative_cases/postive_cases,   # NOT DEFAULT control for imbalanced classes
+             subsample=1,
+             colsample_bytree=1)
+set.seed(123)
+xgbcv<-xgb.cv(params=params,
+              data=xgb_train,
+              nrounds=100,                        
+              nfold=5,
+ #             metrics = list("rmse","auc"),
+              showsd=T,
+              stratified=T,
+              print_every_n=10,
+              early_stopping_rounds=10,            
+              maximize=F)
+```
+Review model
+```{r}
+xgbcv
+min(xgbcv$evaluation_log$test_logloss_mean)
+```
+Train the XGBoost classifer
+```{r}
+set.seed(123)
+xgb1<-xgb.train(params=params,
+                data=xgb_train,                    
+                nrounds=42,
+                watchlist=list(val=xgb_test,train=xgb_train),
+                print_every_n=10,
+                early_stopping_rounds=10,
+                maximize=F,
+                eval_metric="error")                  # 'logloss'
+```
+Predict outcomes with the test data
+```{r}
+xgb1_pred<-predict(xgb1,test_data)
+my_roc1<-roc(test_label,xgb1_pred)
+plot(my_roc1,print.thres="best",print.thres.best.method="youden",
+     print.thres.best.weights=c(50,0.2))
+coords(my_roc1,"best",ret=c("threshold","specificity","sensitivity","accuracy",
+                           "precision","recall"),transpose=FALSE)
+```
+
+```{r}
+importance_matrix1<-xgb.importance(model=xgb1)
+print(importance_matrix1)
+xgb.plot.importance(importance_matrix=importance_matrix1)
+xgb.dump(xgb1,with_stats=TRUE)
+xgb.plot.tree(model=xgb1)
+```
+Define hyperparameter grid, really big! = really slow
+```{r}
+ntrees<-42
+hyper_grid<-expand.grid(
+  eta=2/ntrees,
+  max_depth=c(3,4,5,6,8,10),
+  min_child_weight=c(1,2,3),
+  subsample=c(0.5,0.75,1),
+  colsample_bytree=c(0.4,0.6,0.8,1),
+  gamma=c(0,1,3,10,100,1000),
+  error=0,          # a place to dump error results
+  trees=0)          # a place to dump required number of trees
+```
+Grid search
+```{r}
+for(i in seq_len(nrow(hyper_grid))) {
+  set.seed(123)
+  m<-xgb.cv(
+    data=train_data,
+    label=train_label,
+    nrounds=ntrees,
+    objective="binary:logistic",
+    early_stopping_rounds=10,
+    nfold=5,
+    verbose=1,
+    eval_metric="error",
+    params=list(
+      eta=hyper_grid$eta[i],
+      max_depth=hyper_grid$max_depth[i],
+      min_child_weight=hyper_grid$min_child_weight[i],
+      subsample=hyper_grid$subsample[i],
+      colsample_bytree=hyper_grid$colsample_bytree[i],
+      gamma=hyper_grid$gamma[i])
+  )
+  #hyper_grid$logloss[i]<-min(m$evaluation_log$test_logloss_mean)
+  hyper_grid$error[i]<-min(m$evaluation_log$test_error_mean)
+  hyper_grid$trees[i]<-m$best_iteration}
+```
+Results of search
+```{r}
+hyper_grid %>%
+  filter(error>0) %>%
+  arrange(error) %>%
+  glimpse()
+```
+Optimal parameter list from results of grid search
+```{r}
+params<-list(
+  eta=0.04761905,
+  max_depth=10,
+  min_child_weight=1,
+  subsample=0.75,
+  colsample_bytree=0.6,
+  gamma=0)
+```
+Train final model
+```{r}
+set.seed(123)
+xgb_final<-xgboost(
+  params=params,
+  data=train_data,
+  label=train_label,
+  nrounds=31,
+  objective="binary:logistic",
+  early_stopping_rounds=10,
+  nfold=5,
+  verbose = 0,
+  eval_metric="error")
+
+xgb_pred_final<-predict(xgb_final,test_data)
+library(pROC)
+my_roc_final<-roc(test_label,xgb_pred_final)
+coords(my_roc_final,"best",ret=c("threshold","specificity","sensitivity","accuracy",
+                           "precision","recall"),transpose=FALSE)
+```
+Importance matrix
+```{r}
+importance_matrix<-xgb.importance(model=xgb_final)
+print(importance_matrix)
+xgb.plot.importance(importance_matrix=importance_matrix)
+xgb.dump(xgb_final,with_stats=TRUE)
+xgb.plot.tree(model=xgb_final)
+```
+# Evaluation
+
+Recommend using model. Risk of overfitting real, though holdout wants you to believe otherwise.  Should try SHAP for detailed review... later
+
+Final model against holdout
+```{r}
+xgb_pred_finalvsholdout<-predict(xgb_final,holdout_data)
+library(pROC)
+my_roc_finalvsholdout<-roc(holdout_label,xgb_pred_finalvsholdout)
+coords(my_roc_finalvsholdout,"best",ret=c("threshold","specificity","sensitivity","accuracy",
+                                 "precision","recall"),transpose=FALSE)
+```
+
+```{r}
+plot.roc(holdout_label,xgb_pred_finalvsholdout)
+plot(my_roc_finalvsholdout,print.thres="best",       
+     print.thres.best.weights=c(50,0.2))
+```
+Confusion matrix
+```{r}
+xgb_pred <- ifelse (xgb_pred_finalvsholdout>=0.3290529,1,0)
+table(holdout_label, xgb_pred)  
+```
+# Deployment
+
+XGBoost recommended. Need modern tool for email scraping, since this is party like it's 1999 stuff. Otherwise make pipeline and deploy. Spam goes to quarantine non spam goes to your inbox.  Bribe SAM to install with pizza at Proto's.
+
+
+
+
